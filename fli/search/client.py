@@ -21,7 +21,9 @@ callers cooperate cleanly under Google's 10 req/sec ceiling.
 from __future__ import annotations
 
 import os
+import random
 import threading
+import time
 from typing import TYPE_CHECKING, Any
 
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -71,6 +73,36 @@ if _env_timeout is not None:
         raise ValueError(f"FLI_TIMEOUT must be a positive number, got: {_env_timeout!r}")
 else:
     REQUEST_TIMEOUT = DEFAULT_TIMEOUT
+
+# Per-egress-IP request pacing. RPC scraping needs far fewer requests than the
+# browser, so we keep each proxy IP slow and let aggregate throughput come from
+# rotating across many IPs rather than hammering one. Each proxy is held to one
+# request per PER_PROXY_INTERVAL seconds plus up to PER_PROXY_JITTER of jitter,
+# which also serialises the parallel expansion workers that share a proxy.
+PER_PROXY_INTERVAL: float = float(os.environ.get("FLI_PER_PROXY_INTERVAL", "1.0"))
+PER_PROXY_JITTER: float = float(os.environ.get("FLI_PER_PROXY_JITTER", "1.0"))
+
+
+class _ProxyPacer:
+    """Serialises requests per proxy key to a minimum interval plus jitter."""
+
+    def __init__(self) -> None:
+        self._next_allowed: dict[str, float] = {}
+        self._lock = threading.Lock()
+
+    def wait(self, key: str) -> None:
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                ready_at = self._next_allowed.get(key, 0.0)
+                if now >= ready_at:
+                    self._next_allowed[key] = now + PER_PROXY_INTERVAL + random.uniform(0, PER_PROXY_JITTER)
+                    return
+                sleep_for = ready_at - now
+            time.sleep(sleep_for)
+
+
+_proxy_pacer = _ProxyPacer()
 
 
 class Client:
@@ -132,10 +164,12 @@ class Client:
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(), reraise=True)
     def get(self, url: str, **kwargs: Any) -> Response:
         """Make a rate-limited GET request with automatic retries."""
-        self._rate_limiter.acquire()
-        kwargs.setdefault("timeout", REQUEST_TIMEOUT)
         if self._proxy is not None:
+            _proxy_pacer.wait(self._proxy)
             kwargs.setdefault("proxy", self._proxy)
+        else:
+            self._rate_limiter.acquire()
+        kwargs.setdefault("timeout", REQUEST_TIMEOUT)
         try:
             response = self._session().get(url, **kwargs)
             response.raise_for_status()
@@ -146,10 +180,12 @@ class Client:
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(), reraise=True)
     def post(self, url: str, **kwargs: Any) -> Response:
         """Make a rate-limited POST request with automatic retries."""
-        self._rate_limiter.acquire()
-        kwargs.setdefault("timeout", REQUEST_TIMEOUT)
         if self._proxy is not None:
+            _proxy_pacer.wait(self._proxy)
             kwargs.setdefault("proxy", self._proxy)
+        else:
+            self._rate_limiter.acquire()
+        kwargs.setdefault("timeout", REQUEST_TIMEOUT)
         try:
             response = self._session().post(url, **kwargs)
             response.raise_for_status()
