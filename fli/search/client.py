@@ -90,10 +90,17 @@ class Client:
     def __init__(
         self,
         calls_per_second: int = DEFAULT_CALLS_PER_SECOND,
+        proxy: str | None = None,
     ):
-        """Initialise the shared rate limiter and per-thread session storage."""
+        """Initialise the rate limiter, per-thread sessions, and optional proxy.
+
+        ``proxy`` (an ``http(s)://`` or ``socks5://`` URL) is applied to every
+        request this client makes, including the parallel expansion workers,
+        which all share this instance.
+        """
         self._sessions = threading.local()
         self._rate_limiter = TokenBucketRateLimiter(calls=calls_per_second, period=1.0)
+        self._proxy = proxy
 
     def _session(self) -> Session:
         """Return this thread's ``Session``, creating it on first use."""
@@ -127,6 +134,8 @@ class Client:
         """Make a rate-limited GET request with automatic retries."""
         self._rate_limiter.acquire()
         kwargs.setdefault("timeout", REQUEST_TIMEOUT)
+        if self._proxy is not None:
+            kwargs.setdefault("proxy", self._proxy)
         try:
             response = self._session().get(url, **kwargs)
             response.raise_for_status()
@@ -139,6 +148,8 @@ class Client:
         """Make a rate-limited POST request with automatic retries."""
         self._rate_limiter.acquire()
         kwargs.setdefault("timeout", REQUEST_TIMEOUT)
+        if self._proxy is not None:
+            kwargs.setdefault("proxy", self._proxy)
         try:
             response = self._session().post(url, **kwargs)
             response.raise_for_status()

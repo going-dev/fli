@@ -17,7 +17,7 @@ from fli.models.google_flights.base import TripType
 from fli.search._concurrency import parallel_map
 from fli.search._urls import with_locale_params
 from fli.search._wire import parse_first_wrb_payload
-from fli.search.client import get_client
+from fli.search.client import Client, get_client
 
 logger = logging.getLogger(__name__)
 
@@ -43,9 +43,9 @@ class SearchDates:
     }
     MAX_DAYS_PER_SEARCH = 61
 
-    def __init__(self):
-        """Initialize the search client for date-based searches."""
-        self.client = get_client()
+    def __init__(self, proxy: str | None = None):
+        """Initialize the search client, optionally bound to a proxy."""
+        self.client = Client(proxy=proxy) if proxy else get_client()
 
     def search(
         self,

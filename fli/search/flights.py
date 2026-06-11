@@ -28,7 +28,7 @@ from fli.search._decoders import (
 from fli.search._urls import with_locale_params
 from fli.search._urls import with_locale_params as _with_locale_params  # noqa: F401
 from fli.search._wire import iter_wrb_chunks, parse_first_wrb_payload
-from fli.search.client import get_client
+from fli.search.client import Client, get_client
 
 logger = logging.getLogger(__name__)
 
@@ -79,9 +79,9 @@ class SearchFlights:
         "content-type": "application/x-www-form-urlencoded;charset=UTF-8",
     }
 
-    def __init__(self):
-        """Initialize the search client."""
-        self.client = get_client()
+    def __init__(self, proxy: str | None = None):
+        """Initialize the search client, optionally bound to a proxy."""
+        self.client = Client(proxy=proxy) if proxy else get_client()
         # Last successful search response's ``inner[0][4]`` — the shopping
         # session id used to authenticate the follow-up GetBookingResults
         # call. Captured automatically by :meth:`search` so that
