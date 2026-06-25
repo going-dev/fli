@@ -1,5 +1,6 @@
 from .dates import DatePrice, SearchDates
 from .exceptions import (
+    GoogleFlightsUpstreamError,
     SearchClientError,
     SearchConnectionError,
     SearchHTTPError,
@@ -15,4 +16,5 @@ __all__ = [
     "SearchTimeoutError",
     "SearchConnectionError",
     "SearchHTTPError",
+    "GoogleFlightsUpstreamError",
 ]

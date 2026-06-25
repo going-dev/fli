@@ -29,6 +29,8 @@ import logging
 from collections.abc import Iterator
 from typing import Any
 
+from fli.search.exceptions import GoogleFlightsUpstreamError
+
 logger = logging.getLogger(__name__)
 
 _PREFIX = b")]}'"
@@ -94,14 +96,62 @@ def iter_wrb_chunks(body: str | bytes) -> Iterator[Any]:
         yield from _chunks_from_outer(outer)
 
 
+def _grpc_error_in_frame(frame: Any) -> tuple[int, str | None] | None:
+    """Detect Google's structured ErrorResponse envelope in a ``wrb.fr`` frame.
+
+    A success frame is ``["wrb.fr", null, "<json>"]`` with the payload at index
+    2. When Google rejects the request it still answers HTTP 200 but replaces
+    that payload with an error block, e.g.::
+
+        ["wrb.fr", null, null, null, null,
+         [13, null, [["type.googleapis.com/travel.frontend.flights.ErrorResponse", ...]]]]
+
+    The leading int (``13`` here) is a gRPC status code (13 = INTERNAL). Returns
+    ``(grpc_code, type_url)`` when such a block is present, else ``None``.
+    ``bool`` (an ``int`` subclass) and code ``0`` (OK) are deliberately not
+    treated as errors so neither trips a false positive.
+    """
+    if not isinstance(frame, list):
+        return None
+    for element in frame:
+        if not (isinstance(element, list) and len(element) >= 3):
+            continue
+        code = element[0]
+        if type(code) is not int or code == 0:
+            continue
+        try:
+            type_url = element[2][0][0]
+        except (IndexError, TypeError):
+            type_url = None
+        if isinstance(type_url, str) and type_url.endswith(".ErrorResponse"):
+            return code, type_url
+    return None
+
+
 def _chunks_from_outer(outer: Any) -> Iterator[Any]:
-    """Walk a top-level chunk list and yield decoded inner-JSON payloads."""
+    """Walk a top-level chunk list and yield decoded inner-JSON payloads.
+
+    Raises :class:`~fli.search.exceptions.GoogleFlightsUpstreamError` when a
+    frame carries Google's structured ErrorResponse envelope (an HTTP-200
+    upstream rejection). Without this, the error frame's payload slot is null,
+    so the reader would skip it and the caller would see a silent empty result
+    indistinguishable from "no flights".
+    """
     if not isinstance(outer, list):
         return
     for row in outer:
-        if not isinstance(row, list) or len(row) < 3:
+        if not isinstance(row, list):
             continue
-        if row[0] != "wrb.fr":
+        error = _grpc_error_in_frame(row)
+        if error is not None:
+            grpc_code, type_url = error
+            logger.warning(
+                "Google Flights returned an ErrorResponse (gRPC %s, %s)",
+                grpc_code,
+                type_url,
+            )
+            raise GoogleFlightsUpstreamError(grpc_code, type_url=type_url)
+        if len(row) < 3 or row[0] != "wrb.fr":
             continue
         inner = row[2]
         if not isinstance(inner, str) or not inner:
