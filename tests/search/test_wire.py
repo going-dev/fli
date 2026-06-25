@@ -2,7 +2,10 @@
 
 import json
 
+import pytest
+
 from fli.search._wire import iter_wrb_chunks, parse_first_wrb_payload
+from fli.search.exceptions import GoogleFlightsUpstreamError
 
 
 def _single_chunk(payload):
@@ -141,3 +144,43 @@ class TestParseFirstWrbPayloadEdgeCases:
         outer = [["wrb.fr", None, bad_inner], ["wrb.fr", None, good_inner]]
         body = ")]}'\n\n" + json.dumps(outer)
         assert parse_first_wrb_payload(body) == [42]
+
+
+_ERROR_TYPE_URL = "type.googleapis.com/travel.frontend.flights.ErrorResponse"
+
+
+def _error_envelope(grpc_code=13, type_url=_ERROR_TYPE_URL):
+    """Build Google's HTTP-200 ErrorResponse envelope.
+
+    The success payload slot (index 2) is null; the error block carries the
+    gRPC status code and the ErrorResponse type URL.
+    """
+    outer = [["wrb.fr", None, None, None, None, [grpc_code, None, [[type_url]]]]]
+    return ")]}'\n\n" + json.dumps(outer)
+
+
+class TestErrorEnvelope:
+    def test_iter_raises_with_grpc_code(self):
+        with pytest.raises(GoogleFlightsUpstreamError) as exc:
+            list(iter_wrb_chunks(_error_envelope(13)))
+        assert exc.value.grpc_code == 13
+        assert exc.value.type_url.endswith(".ErrorResponse")
+        assert "13 INTERNAL" in str(exc.value)
+
+    def test_parse_first_raises(self):
+        with pytest.raises(GoogleFlightsUpstreamError):
+            parse_first_wrb_payload(_error_envelope(8))
+
+    def test_success_frame_still_parses(self):
+        # Detection must not disturb a normal response.
+        body = _single_chunk([1, "ok", [2, 3]])
+        assert list(iter_wrb_chunks(body)) == [[1, "ok", [2, 3]]]
+
+    def test_non_error_type_url_does_not_false_positive(self):
+        # An int-leading block whose type URL is not an ErrorResponse is ignored.
+        body = _error_envelope(13, type_url="type.googleapis.com/foo.Bar")
+        assert list(iter_wrb_chunks(body)) == []
+
+    def test_grpc_code_zero_is_not_an_error(self):
+        # Code 0 is OK; it must not raise.
+        assert list(iter_wrb_chunks(_error_envelope(0))) == []
