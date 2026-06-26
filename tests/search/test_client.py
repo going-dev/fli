@@ -118,3 +118,83 @@ class TestGetClientSingleton:
         client_module.client = None
         c2 = get_client()
         assert c1 is not c2
+
+
+class TestRetryClassification:
+    """Only an unclassified transport blip is retried; doomed/typed errors are not."""
+
+    def test_bare_client_error_is_retryable(self):
+        assert client_module._is_retryable_transport_error(SearchClientError("blip")) is True
+
+    def test_typed_errors_are_not_retryable(self):
+        from fli.search.exceptions import GoogleFlightsUpstreamError
+
+        for exc in (
+            SearchTimeoutError("t"),
+            SearchConnectionError("c"),
+            SearchHTTPError("h", status_code=503),
+            GoogleFlightsUpstreamError(13),
+        ):
+            assert client_module._is_retryable_transport_error(exc) is False
+
+
+class TestEnvParsing:
+    def test_seconds_default_and_valid(self, monkeypatch):
+        monkeypatch.delenv("X_SECS", raising=False)
+        assert client_module._env_seconds("X_SECS", 5.0) == 5.0
+        monkeypatch.setenv("X_SECS", "2.5")
+        assert client_module._env_seconds("X_SECS", 5.0) == 2.5
+
+    def test_seconds_rejects_negative_and_nonnumeric(self, monkeypatch):
+        monkeypatch.setenv("X_SECS", "-1")
+        with pytest.raises(ValueError):
+            client_module._env_seconds("X_SECS", 5.0)
+        monkeypatch.setenv("X_SECS", "abc")
+        with pytest.raises(ValueError):
+            client_module._env_seconds("X_SECS", 5.0)
+
+    def test_int_default_and_valid(self, monkeypatch):
+        monkeypatch.delenv("X_N", raising=False)
+        assert client_module._env_int("X_N", 2) == 2
+        monkeypatch.setenv("X_N", "4")
+        assert client_module._env_int("X_N", 2) == 4
+
+
+class TestSessionCurlOptions:
+    """_session sets a connect timeout always, and low-speed only when enabled."""
+
+    def _capture(self, monkeypatch):
+        import curl_cffi.requests as cr
+
+        captured = {}
+
+        class _FakeSession:
+            def __init__(self, *args, curl_options=None, **kwargs):
+                captured["opts"] = curl_options or {}
+                self.headers = {}
+
+        monkeypatch.setattr(cr, "Session", _FakeSession)
+        return captured
+
+    def test_connect_timeout_always_set_low_speed_off_by_default(self, monkeypatch):
+        from curl_cffi import CurlOpt
+
+        from fli.search.client import Client
+
+        captured = self._capture(monkeypatch)
+        monkeypatch.setattr(client_module, "LOW_SPEED_TIME", 0)
+        Client()._session()
+        assert CurlOpt.CONNECTTIMEOUT in captured["opts"]
+        assert CurlOpt.LOW_SPEED_TIME not in captured["opts"]
+
+    def test_low_speed_set_when_enabled(self, monkeypatch):
+        from curl_cffi import CurlOpt
+
+        from fli.search.client import Client
+
+        captured = self._capture(monkeypatch)
+        monkeypatch.setattr(client_module, "LOW_SPEED_TIME", 6)
+        monkeypatch.setattr(client_module, "LOW_SPEED_LIMIT", 1)
+        Client()._session()
+        assert captured["opts"][CurlOpt.LOW_SPEED_TIME] == 6
+        assert captured["opts"][CurlOpt.LOW_SPEED_LIMIT] == 1

@@ -26,7 +26,13 @@ import threading
 import time
 from typing import TYPE_CHECKING, Any
 
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import (
+    retry,
+    retry_if_exception,
+    stop_after_attempt,
+    stop_after_delay,
+    wait_exponential,
+)
 
 from fli.search._concurrency import TokenBucketRateLimiter
 from fli.search.exceptions import (
@@ -74,6 +80,53 @@ if _env_timeout is not None:
 else:
     REQUEST_TIMEOUT = DEFAULT_TIMEOUT
 
+
+def _env_seconds(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        raise ValueError(f"{name} must be a number of seconds, got: {raw!r}") from None
+    if value < 0:
+        raise ValueError(f"{name} must be >= 0, got: {raw!r}")
+    return value
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError(f"{name} must be an integer, got: {raw!r}") from None
+    if value < 0:
+        raise ValueError(f"{name} must be >= 0, got: {raw!r}")
+    return value
+
+
+# Connection-establishment timeout. A proxy or host we can't connect to quickly
+# is doomed, not slow, so fail it fast instead of letting it sit on a worker.
+CONNECT_TIMEOUT: float = _env_seconds("FLI_CONNECT_TIMEOUT", 5.0)
+
+# No-progress (low-speed) abort. libcurl aborts a transfer that averages fewer
+# than LOW_SPEED_LIMIT bytes/sec over LOW_SPEED_TIME seconds. This kills a
+# stalled connection that will never deliver while leaving a slow-but-streaming
+# response alone, something a total timeout cannot distinguish. LOW_SPEED_TIME
+# must sit ABOVE the upstream's worst no-byte think-time (time-to-first-byte) or
+# it will clip valid slow responses, so it defaults off (0) and is enabled per
+# deployment once tuned. REQUEST_TIMEOUT stays the absolute backstop.
+LOW_SPEED_LIMIT: int = _env_int("FLI_LOW_SPEED_LIMIT", 1)
+LOW_SPEED_TIME: int = int(_env_seconds("FLI_LOW_SPEED_TIME", 0.0))
+
+# Retries cover a transient transport blip, not a doomed call. Bound both the
+# attempt count and the total wall time so a retry can never multiply how long
+# we hold a worker (see _is_retryable_transport_error for which errors qualify).
+MAX_ATTEMPTS: int = max(1, _env_int("FLI_MAX_ATTEMPTS", 2))
+RETRY_DEADLINE: float = _env_seconds("FLI_RETRY_DEADLINE", REQUEST_TIMEOUT)
+
 # Per-egress-IP request pacing. RPC scraping needs far fewer requests than the
 # browser, so we keep each proxy IP slow and let aggregate throughput come from
 # rotating across many IPs rather than hammering one. Each proxy is held to one
@@ -96,13 +149,39 @@ class _ProxyPacer:
                 now = time.monotonic()
                 ready_at = self._next_allowed.get(key, 0.0)
                 if now >= ready_at:
-                    self._next_allowed[key] = now + PER_PROXY_INTERVAL + random.uniform(0, PER_PROXY_JITTER)
+                    self._next_allowed[key] = (
+                        now + PER_PROXY_INTERVAL + random.uniform(0, PER_PROXY_JITTER)
+                    )
                     return
                 sleep_for = ready_at - now
             time.sleep(sleep_for)
 
 
 _proxy_pacer = _ProxyPacer()
+
+
+def _is_retryable_transport_error(exc: BaseException) -> bool:
+    """Decide whether a failed request is worth one bounded retry.
+
+    Retry only an unclassified transport hiccup (e.g. a mid-stream reset),
+    never a timeout, a refused/unreachable host, an HTTP error, or an upstream
+    gRPC rejection. Retrying those either can't help (a dead proxy refuses
+    again, a 4xx/429 won't change on an instant retry) or just multiplies the
+    time we hold a worker on a call that already failed, which is the exact
+    stall we are trying to avoid. The connect and low-speed timeouts already
+    fail the doomed cases fast; this leaves a single bounded retry for a blip.
+    """
+    return type(exc) is SearchClientError
+
+
+# Shared retry policy for get/post: a bounded attempt count AND a hard total-time
+# ceiling (whichever trips first), applied only to retryable transport errors.
+_RETRY = {
+    "retry": retry_if_exception(_is_retryable_transport_error),
+    "stop": stop_after_attempt(MAX_ATTEMPTS) | stop_after_delay(RETRY_DEADLINE),
+    "wait": wait_exponential(multiplier=0.5, max=2.0),
+    "reraise": True,
+}
 
 
 class Client:
@@ -141,9 +220,18 @@ class Client:
             # Deferred import: ``curl_cffi`` is heavy (~100ms cold) and
             # not needed for CLI flows that never hit the network, so
             # only pull it in on the first real request.
+            from curl_cffi import CurlOpt
             from curl_cffi import requests as _requests
 
-            session = _requests.Session()
+            # Connect + no-progress options apply to every request on this
+            # session: fail fast when we can't connect, or when a transfer
+            # stalls, without capping a slow-but-progressing response.
+            # REQUEST_TIMEOUT (passed per request) stays the absolute backstop.
+            curl_options = {CurlOpt.CONNECTTIMEOUT: int(CONNECT_TIMEOUT)}
+            if LOW_SPEED_TIME > 0:
+                curl_options[CurlOpt.LOW_SPEED_LIMIT] = LOW_SPEED_LIMIT
+                curl_options[CurlOpt.LOW_SPEED_TIME] = LOW_SPEED_TIME
+            session = _requests.Session(curl_options=curl_options)
             session.headers.update(self.DEFAULT_HEADERS)
             self._sessions.session = session
         return session
@@ -161,7 +249,7 @@ class Client:
     # Request entry points
     # ------------------------------------------------------------------
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(), reraise=True)
+    @retry(**_RETRY)
     def get(self, url: str, **kwargs: Any) -> Response:
         """Make a rate-limited GET request with automatic retries."""
         if self._proxy is not None:
@@ -177,7 +265,7 @@ class Client:
         except Exception as e:
             raise _wrap_request_error("GET", url, e) from e
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(), reraise=True)
+    @retry(**_RETRY)
     def post(self, url: str, **kwargs: Any) -> Response:
         """Make a rate-limited POST request with automatic retries."""
         if self._proxy is not None:
